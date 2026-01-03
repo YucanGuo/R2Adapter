@@ -1,0 +1,168 @@
+root_dir: "."
+
+models:
+  # Use vLLM as the default chat model (llama-3.3-70B)
+  default_chat_model:
+    type: chat                    # Use LiteLLM type; automatically uses the model's tokenizer
+    model_provider: openai        # Uses an OpenAI-compatible interface
+    model: Llama-3.3-70B-Instruct  # llama-3.3-70B 模型名称
+    # Do not set encoding_model; let LiteLLM use the model's tokenizer automatically
+    api_base: http://localhost:8000/v1  # Address of the vLLM service (default port 8000)
+    api_key: "EMPTY"           # vLLM does not require an API key
+    auth_type: api_key
+    temperature: 0.0
+    max_tokens: 8192
+    request_timeout: 300.0
+
+  # Use local NV-Embed-V2 as the default embedding model
+  default_embedding_model:
+    type: nvembed_embedding    # Use the registered custom NV-Embed type
+    model: nvidia/NV-Embed-v2
+    model_name: models/huggingface.co/nvidia/NV-Embed-v2  # NV-Embed-V2 model name or local path
+    encoding_model: ""
+    api_key: "EMPTY"  # Local models don't need an API key, but config validation requires this field
+    auth_type: api_key
+    device: cuda                # Use "cuda" (if GPU available), otherwise use "cpu"
+
+  # Embedding model configuration for local search
+  local_search_embedding_model:
+    type: nvembed_embedding
+    model: nvidia/NV-Embed-v2
+    model_name: models/huggingface.co/nvidia/NV-Embed-v2
+    encoding_model: ""
+    api_key: "EMPTY"  # Local models don't need an API key, but config validation requires this field
+    auth_type: api_key
+    device: cuda
+
+  # Embedding model configuration for basic search
+  basic_search_embedding_model:
+    type: nvembed_embedding
+    model: nvidia/NV-Embed-v2
+    model_name: models/huggingface.co/nvidia/NV-Embed-v2
+    encoding_model: ""
+    api_key: "EMPTY"  # Local models don't need an API key, but config validation requires this field
+    auth_type: api_key
+    device: cuda
+
+  # Chat model configuration for local search
+  local_search_chat_model:
+    type: chat                    # Use LiteLLM type; automatically uses the model's tokenizer
+    model_provider: openai        # Uses an OpenAI-compatible interface
+    model: Llama-3.3-70B-Instruct
+    # Do not set encoding_model; let LiteLLM use the model's tokenizer automatically
+    api_base: http://localhost:8000/v1
+    api_key: "EMPTY"
+    auth_type: api_key
+    temperature: 0.0
+    max_tokens: 8192
+
+  # Chat model configuration for basic search
+  basic_search_chat_model:
+    type: chat                    # Use LiteLLM type; automatically uses the model's tokenizer
+    model_provider: openai        # Uses an OpenAI-compatible interface
+    model: Llama-3.3-70B-Instruct
+    # Do not set encoding_model; let LiteLLM use the model's tokenizer automatically
+    api_base: http://localhost:8000/v1
+    api_key: "EMPTY"
+    auth_type: api_key
+    temperature: 0.0
+    max_tokens: 8192
+
+# Input configuration
+input:
+  storage:
+    type: file
+    base_dir: "graphrag/input"
+  file_type: json
+  file_pattern: "*.json"
+  text_column: "text"
+  title_column: "title"
+
+# Output configuration
+output:
+  storage:
+    type: file
+    base_dir: "graphrag/output"
+
+# Vector store configuration
+vector_store:
+  default_vector_store:
+    type: lancedb
+    db_uri: "graphrag/output/lancedb"
+    container_name: default
+
+### Workflow settings ###
+
+embed_text:
+  model_id: default_embedding_model
+  vector_store_id: default_vector_store
+
+extract_graph:
+  model_id: default_chat_model
+  prompt: "graphrag/prompts/extract_graph.txt"
+  entity_types: [organization,person,geo,event]
+  max_gleanings: 1
+
+summarize_descriptions:
+  model_id: default_chat_model
+  prompt: "graphrag/prompts/summarize_descriptions.txt"
+  max_length: 500
+
+extract_graph_nlp:
+  text_analyzer:
+    extractor_type: regex_english # [regex_english, syntactic_parser, cfg]
+  async_mode: threaded # or asyncio
+
+cluster_graph:
+  max_cluster_size: 10
+
+extract_claims:
+  enabled: false
+  model_id: default_chat_model
+  prompt: "graphrag/prompts/extract_claims.txt"
+  description: "Any claims or facts that could be relevant to information discovery."
+  max_gleanings: 1
+
+community_reports:
+  model_id: default_chat_model
+  graph_prompt: "graphrag/prompts/community_report_graph.txt"
+  text_prompt: "graphrag/prompts/community_report_text.txt"
+  max_length: 2000
+  max_input_length: 8000
+
+embed_graph:
+  enabled: false # if true, will generate node2vec embeddings for nodes
+
+umap:
+  enabled: false # if true, will generate UMAP embeddings for nodes (embed_graph must also be enabled)
+
+snapshots:
+  graphml: false
+  embeddings: false
+
+### Query settings ###
+## The prompt locations are required here, but each search method has a number of optional knobs that can be tuned.
+## See the config docs: https://microsoft.github.io/graphrag/config/yaml/#query
+
+local_search:
+  chat_model_id: default_chat_model
+  embedding_model_id: default_embedding_model
+  prompt: "graphrag/prompts/local_search_system_prompt.txt"
+
+global_search:
+  chat_model_id: default_chat_model
+  map_prompt: "graphrag/prompts/global_search_map_system_prompt.txt"
+  reduce_prompt: "graphrag/prompts/global_search_reduce_system_prompt.txt"
+  knowledge_prompt: "graphrag/prompts/global_search_knowledge_system_prompt.txt"
+
+drift_search:
+  chat_model_id: default_chat_model
+  embedding_model_id: default_embedding_model
+  prompt: "graphrag/prompts/drift_search_system_prompt.txt"
+  reduce_prompt: "graphrag/prompts/drift_search_reduce_prompt.txt"
+
+basic_search:
+  chat_model_id: default_chat_model
+  embedding_model_id: default_embedding_model
+  prompt: "graphrag/prompts/basic_search_system_prompt.txt"
+
