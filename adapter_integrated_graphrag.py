@@ -372,7 +372,6 @@ class RouterIntegratedGraphRAG:
         
         # Performance metrics
         self.performance_metrics = {
-            "total_retrieval_time": 0.0,
             "total_qa_time": 0.0,
             "retrieval_recall_at_k": {},
             "qa_em_scores": [],
@@ -383,24 +382,20 @@ class RouterIntegratedGraphRAG:
         self.detailed_stats = {
             "graph": {
                 "query_count": 0,
-                "retrieval_time": 0.0,
                 "qa_time": 0.0,
                 "retrieval_recall_at_k": {},
                 "qa_em_scores": [],
                 "qa_f1_scores": [],
-                "avg_retrieval_time_per_query": 0.0,
                 "avg_qa_time_per_query": 0.0,
                 "avg_em_score": 0.0,
                 "avg_f1_score": 0.0
             },
             "passage": {
                 "query_count": 0,
-                "retrieval_time": 0.0,
                 "qa_time": 0.0,
                 "retrieval_recall_at_k": {},
                 "qa_em_scores": [],
                 "qa_f1_scores": [],
-                "avg_retrieval_time_per_query": 0.0,
                 "avg_qa_time_per_query": 0.0,
                 "avg_em_score": 0.0,
                 "avg_f1_score": 0.0
@@ -763,10 +758,9 @@ class RouterIntegratedGraphRAG:
         
         return response, context_data
     
-    async def _basic_search(self, query: str) -> Tuple[str, Dict]:
+    async def _graphrag_basic_search(self, query: str) -> Tuple[str, Dict]:
         """
-        Perform passage search using DPR (StandardRAG) if available; 
-        otherwise fall back to GraphRAG BasicSearch
+        Perform passage retrieval using GraphRAG BasicSearch fallback path.
         
         Args:
             query: Query string
@@ -774,17 +768,6 @@ class RouterIntegratedGraphRAG:
         Returns:
             Tuple[str, Dict]: (response, context_data)
         """
-        # Prefer DPR (StandardRAG) for speed if configured
-        if self.standard_rag:
-            result = self.standard_rag.rag_qa([query])
-            if len(result) >= 3:
-                _, answers, metadata = result[:3]
-                answer = answers[0] if answers else ""
-                meta = metadata[0] if metadata else {}
-                return answer, meta
-            return "", {}
-        
-        # Fallback: GraphRAG BasicSearch
         if not self.graphrag_config:
             raise ValueError("GraphRAG config is required")
         
@@ -873,12 +856,13 @@ class RouterIntegratedGraphRAG:
             logger.info(f"Processing {len(graph_indices)} graph queries with GraphRAG...")
             graph_queries = [final_queries[i] for i in graph_indices]
             
-            retrieval_time_before = time.time()
+            graph_task_time = 0.0
             for idx, query in enumerate(graph_indices):
                 original_idx = graph_indices[idx]
                 query_text = graph_queries[idx]
                 
                 try:
+                    task_start = time.time()
                     response, context_data = await self._graph_search(query_text)
                     # Post-process using HippoRAG's QA prompt to ensure consistent format
                     response = postprocess_graphrag_response(
@@ -887,6 +871,7 @@ class RouterIntegratedGraphRAG:
                         qa_llm=self.qa_llm,
                         prompt_template_manager=self.prompt_template_manager
                     )
+                    graph_task_time += time.time() - task_start
                     all_answers[original_idx] = response
                     all_metadata[original_idx] = context_data
                     gold_answer = str(gold_answers[original_idx])
@@ -896,8 +881,6 @@ class RouterIntegratedGraphRAG:
                     logger.error(f"Error processing graph query {original_idx}: {e}")
                     all_answers[original_idx] = ""
                     all_metadata[original_idx] = {}
-            
-            actual_retrieval_time = time.time() - retrieval_time_before
             
             # Compute QA metrics for graph queries if gold_answers provided
             graph_qa_metrics = None
@@ -910,37 +893,52 @@ class RouterIntegratedGraphRAG:
             self._update_detailed_stats(
                 strategy="graph",
                 query_count=len(graph_indices),
-                retrieval_time=actual_retrieval_time,
+                qa_time=graph_task_time,
                 retrieval_metrics=None,  # GraphRAG doesn't provide retrieval metrics directly
                 qa_metrics=graph_qa_metrics
             )
             
             logger.info(f"Graph queries completed: {len(graph_indices)} queries")
         
-        # Process passage queries with BasicSearch
+        # Process passage queries (batch: StandardRAG.rag_qa; fallback: concurrent basic search)
         if passage_indices:
             logger.info(f"Processing {len(passage_indices)} passage queries with BasicSearch...")
             passage_queries = [final_queries[i] for i in passage_indices]
-            
-            retrieval_time_before = time.time()
-            for idx, query in enumerate(passage_indices):
-                original_idx = passage_indices[idx]
-                query_text = passage_queries[idx]
-                
-                try:
-                    response, context_data = await self._basic_search(query_text)
-                    response = extract_short_answer(response)
-                    all_answers[original_idx] = response
-                    all_metadata[original_idx] = context_data
-                    gold_answer = str(gold_answers[original_idx])
-                    logger.info(f"gold answer: {gold_answer}")
-                    logger.info(f"predicted answer: {all_answers[original_idx]}")
-                except Exception as e:
-                    logger.error(f"Error processing passage query {original_idx}: {e}")
-                    all_answers[original_idx] = ""
-                    all_metadata[original_idx] = {}
-            
-            actual_retrieval_time = time.time() - retrieval_time_before
+            passage_gold_docs = [gold_docs[i] for i in passage_indices] if gold_docs is not None else None
+            passage_gold_answers = [gold_answers[i] for i in passage_indices] if gold_answers is not None else None
+
+            task_start = time.time()
+            if self.standard_rag:
+                rag_kwargs = {}
+                if passage_gold_docs is not None:
+                    rag_kwargs["gold_docs"] = passage_gold_docs
+                if passage_gold_answers is not None:
+                    rag_kwargs["gold_answers"] = passage_gold_answers
+                rag_out = self.standard_rag.rag_qa(passage_queries, **rag_kwargs)
+                if passage_gold_answers is not None:
+                    queries_solutions, _, qa_metadata, _, _ = rag_out
+                else:
+                    queries_solutions, _, qa_metadata = rag_out
+                for j, original_idx in enumerate(passage_indices):
+                    sol = queries_solutions[j] if j < len(queries_solutions) else None
+                    all_answers[original_idx] = sol.answer if sol and sol.answer is not None else ""
+                    all_metadata[original_idx] = qa_metadata[j] if j < len(qa_metadata) else {}
+            else:
+                async def _basic_one(q: str):
+                    r, ctx = await self._graphrag_basic_search(q)
+                    return extract_short_answer(r), ctx
+
+                basic_results = await asyncio.gather(*[_basic_one(q) for q in passage_queries])
+                for j, original_idx in enumerate(passage_indices):
+                    all_answers[original_idx], all_metadata[original_idx] = basic_results[j]
+            passage_task_time = time.time() - task_start
+
+            # if gold_answers is not None:
+            #     for original_idx in passage_indices:
+            #         gold_answer = str(gold_answers[original_idx])
+            #         logger.info(f"gold answer: {gold_answer}")
+            #         logger.info(f"predicted answer: {all_answers[original_idx]}")
+
             
             # Compute QA metrics for passage queries if gold_answers provided
             passage_qa_metrics = None
@@ -953,7 +951,7 @@ class RouterIntegratedGraphRAG:
             self._update_detailed_stats(
                 strategy="passage",
                 query_count=len(passage_indices),
-                retrieval_time=actual_retrieval_time,
+                qa_time=passage_task_time,
                 retrieval_metrics=None,
                 qa_metrics=passage_qa_metrics
             )
@@ -985,10 +983,7 @@ class RouterIntegratedGraphRAG:
             logger.info(f"Overall QA metrics: EM={overall_qa_metrics['ExactMatch']:.4f}, F1={overall_qa_metrics['F1']:.4f}")
         
         # Update overall performance metrics
-        total_retrieval_time = self.detailed_stats["graph"]["retrieval_time"] + self.detailed_stats["passage"]["retrieval_time"]
-        
         self._update_performance_metrics(
-            retrieval_time=total_retrieval_time,
             qa_time=total_time,
             retrieval_metrics=None,
             qa_metrics=overall_qa_metrics
@@ -1045,19 +1040,16 @@ class RouterIntegratedGraphRAG:
             self._rag_qa_async(queries, gold_docs, gold_answers, return_router_info)
         )
     
-    def _update_performance_metrics(self, retrieval_time: float = 0.0, qa_time: float = 0.0, 
+    def _update_performance_metrics(self, qa_time: float = 0.0,
                                   retrieval_metrics: Dict = None, qa_metrics: Dict = None):
         """
         Update performance metrics
         
         Args:
-            retrieval_time: Time spent on retrieval
-            qa_time: Time spent on QA
+            qa_time: End-to-end time for the QA batch (full task wall time)
             retrieval_metrics: Retrieval evaluation metrics
             qa_metrics: QA evaluation metrics
         """
-        # Update timing metrics
-        self.performance_metrics["total_retrieval_time"] = retrieval_time
         self.performance_metrics["total_qa_time"] = qa_time
         
         # Update retrieval metrics
@@ -1071,8 +1063,8 @@ class RouterIntegratedGraphRAG:
             if "F1" in qa_metrics:
                 self.performance_metrics["qa_f1_scores"] = [qa_metrics["F1"]]
     
-    def _update_detailed_stats(self, strategy: str, query_count: int = 1, 
-                             retrieval_time: float = 0.0, qa_time: float = 0.0,
+    def _update_detailed_stats(self, strategy: str, query_count: int = 1,
+                             qa_time: float = 0.0,
                              retrieval_metrics: Dict = None, qa_metrics: Dict = None):
         """
         Update detailed statistics for specific strategy (graph or passage)
@@ -1080,8 +1072,7 @@ class RouterIntegratedGraphRAG:
         Args:
             strategy: Strategy name ("graph" or "passage")
             query_count: Number of queries processed
-            retrieval_time: Time spent on retrieval
-            qa_time: Time spent on QA
+            qa_time: Per-strategy sum of end-to-end time per query (full task)
             retrieval_metrics: Retrieval evaluation metrics
             qa_metrics: QA evaluation metrics
         """
@@ -1089,10 +1080,7 @@ class RouterIntegratedGraphRAG:
             return
             
         # Update query count
-        self.detailed_stats[strategy]["query_count"] += query_count
-        
-        # Update timing metrics
-        self.detailed_stats[strategy]["retrieval_time"] += retrieval_time
+        self.detailed_stats[strategy]["query_count"] += query_count        
         self.detailed_stats[strategy]["qa_time"] += qa_time
         
         # Update retrieval metrics
@@ -1121,8 +1109,6 @@ class RouterIntegratedGraphRAG:
         query_count = stats["query_count"]
         
         if query_count > 0:
-            # Calculate average times
-            stats["avg_retrieval_time_per_query"] = stats["retrieval_time"] / query_count
             stats["avg_qa_time_per_query"] = stats["qa_time"] / query_count
             
             # Calculate average QA scores
@@ -1150,10 +1136,8 @@ class RouterIntegratedGraphRAG:
         if self.performance_metrics["qa_f1_scores"]:
             avg_metrics["avg_f1_score"] = self.performance_metrics["qa_f1_scores"][0]
         
-        # Calculate timing metrics
         total_queries = self.router_stats["total_queries"]
         if total_queries > 0:
-            avg_metrics["avg_retrieval_time_per_query"] = self.performance_metrics["total_retrieval_time"] / total_queries
             avg_metrics["avg_qa_time_per_query"] = self.performance_metrics["total_qa_time"] / total_queries
         
         return avg_metrics
@@ -1235,10 +1219,8 @@ class RouterIntegratedGraphRAG:
             stats = detailed_stats[strategy]
             logger.info(f"\n{strategy.upper()} Strategy:")
             logger.info(f"  Query count: {stats['query_count']} ({stats['query_ratio']:.2%})")
-            logger.info(f"  Total retrieval time: {stats['retrieval_time']:.2f}s")
-            logger.info(f"  Total QA time: {stats['qa_time']:.2f}s")
-            logger.info(f"  Avg retrieval time per query: {stats['avg_retrieval_time_per_query']:.4f}s")
-            logger.info(f"  Avg QA time per query: {stats['avg_qa_time_per_query']:.4f}s")
+            logger.info(f"  Total task time (end-to-end per query summed): {stats['qa_time']:.4f}s")
+            logger.info(f"  Avg task time per query: {stats['avg_qa_time_per_query']:.4f}s")
             
             # QA performance metrics
             if stats['qa_em_scores']:
@@ -1252,11 +1234,9 @@ class RouterIntegratedGraphRAG:
                 for metric, value in stats['avg_retrieval_metrics'].items():
                     logger.info(f"    {metric}: {value:.4f}")
         
-        # Overall timing metrics
         perf_metrics = metrics["performance_metrics"]
         logger.info(f"\nOverall Timing Metrics:")
-        logger.info(f"  Total retrieval time: {perf_metrics['total_retrieval_time']:.2f}s")
-        logger.info(f"  Total QA time: {perf_metrics['total_qa_time']:.2f}s")
+        logger.info(f"  Total task time (full rag_qa batch): {perf_metrics['total_qa_time']:.2f}s")
         
         # Average metrics
         avg_metrics = metrics["average_metrics"]
@@ -1281,7 +1261,6 @@ class RouterIntegratedGraphRAG:
         }
         
         self.performance_metrics = {
-            "total_retrieval_time": 0.0,
             "total_qa_time": 0.0,
             "retrieval_recall_at_k": {},
             "qa_em_scores": [],
@@ -1292,24 +1271,20 @@ class RouterIntegratedGraphRAG:
         self.detailed_stats = {
             "graph": {
                 "query_count": 0,
-                "retrieval_time": 0.0,
                 "qa_time": 0.0,
                 "retrieval_recall_at_k": {},
                 "qa_em_scores": [],
                 "qa_f1_scores": [],
-                "avg_retrieval_time_per_query": 0.0,
                 "avg_qa_time_per_query": 0.0,
                 "avg_em_score": 0.0,
                 "avg_f1_score": 0.0
             },
             "passage": {
                 "query_count": 0,
-                "retrieval_time": 0.0,
                 "qa_time": 0.0,
                 "retrieval_recall_at_k": {},
                 "qa_em_scores": [],
                 "qa_f1_scores": [],
-                "avg_retrieval_time_per_query": 0.0,
                 "avg_qa_time_per_query": 0.0,
                 "avg_em_score": 0.0,
                 "avg_f1_score": 0.0

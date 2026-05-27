@@ -9,6 +9,7 @@ import logging
 from typing import List, Dict, Any, Optional, Tuple
 from abc import ABC, abstractmethod
 import time
+from openai import OpenAI
 
 logger = logging.getLogger(__name__)
 
@@ -31,9 +32,10 @@ class BaseRewriter(ABC):
         self.llm_name = llm_name
         # Provide a default API key so that vLLM (OpenAI-compatible) works without credentials
         self.api_key = api_key or os.getenv("OPENAI_API_KEY") or "dummy-key"
-        
-        # Initialize OpenAI-compatible client lazily
-        self._openai_client = None
+        self._openai_client = OpenAI(
+                base_url=self.llm_base_url,
+                api_key=self.api_key
+        )
     
     @abstractmethod
     def rewrite(self, query: str, **kwargs) -> str:
@@ -78,8 +80,6 @@ class BaseRewriter(ABC):
             str: LLM response
         """
         try:
-            self._ensure_openai_client()
-            
             response = self._openai_client.chat.completions.create(
                 model=self.llm_name,
                 messages=messages,
@@ -150,6 +150,7 @@ class QueryRewriter(BaseRewriter):
         if not self.should_rewrite(strategy, passage_prob or 0.0, graph_prob or 0.0):
             return query
         
+        # logger.info(f"Starting query rewriting: {query} (graph solving probability: {graph_prob})")
         return self._rewrite_for_graph(query)
     
     def _rewrite_for_graph(self, query: str) -> str:
